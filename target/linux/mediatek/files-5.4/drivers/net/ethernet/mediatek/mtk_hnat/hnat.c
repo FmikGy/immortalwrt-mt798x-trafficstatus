@@ -394,7 +394,7 @@ static int hnat_start(u32 ppe_id)
 {
 	u32 foe_table_sz;
 	u32 foe_mib_tb_sz;
-	u32 etry_num_cfg;
+	int etry_num_cfg;
 
 	if (ppe_id >= CFG_PPE_NUM)
 		return -EINVAL;
@@ -434,9 +434,15 @@ static int hnat_start(u32 ppe_id)
 		memset(hnat_priv->foe_mib_cpu[ppe_id], 0, foe_mib_tb_sz);
 
 		hnat_priv->acct[ppe_id] =
-			kzalloc(hnat_priv->foe_etry_num * sizeof(struct hnat_accounting),
-				GFP_KERNEL);
+			kcalloc(hnat_priv->foe_etry_num,
+				sizeof(struct hnat_accounting), GFP_KERNEL);
 		if (!hnat_priv->acct[ppe_id])
+			return -1;
+
+		hnat_priv->acct_sync[ppe_id] =
+			kcalloc(hnat_priv->foe_etry_num,
+				sizeof(struct hnat_accounting), GFP_KERNEL);
+		if (!hnat_priv->acct_sync[ppe_id])
 			return -1;
 	}
 
@@ -538,6 +544,10 @@ static void hnat_stop(u32 ppe_id)
 					  hnat_priv->foe_mib_dev[ppe_id]);
 		writel(0, hnat_priv->ppe_base[ppe_id] + PPE_MIB_TB_BASE);
 		kfree(hnat_priv->acct[ppe_id]);
+		kfree(hnat_priv->acct_sync[ppe_id]);
+		hnat_priv->foe_mib_cpu[ppe_id] = NULL;
+		hnat_priv->acct[ppe_id] = NULL;
+		hnat_priv->acct_sync[ppe_id] = NULL;
 	}
 }
 
@@ -643,10 +653,23 @@ int hnat_warm_init(void)
 		if (hnat_priv->data->per_flow_accounting) {
 			foe_mib_tb_sz =
 				hnat_priv->foe_etry_num * sizeof(struct mib_entry);
+			if (hnat_priv->acct[ppe_id])
+				spin_lock_bh(&hnat_priv->acct_lock[ppe_id]);
+
 			writel(hnat_priv->foe_mib_dev[ppe_id],
 			       hnat_priv->ppe_base[ppe_id] + PPE_MIB_TB_BASE);
 			memset(hnat_priv->foe_mib_cpu[ppe_id], 0,
 			       foe_mib_tb_sz);
+			if (hnat_priv->acct[ppe_id]) {
+				memset(hnat_priv->acct[ppe_id], 0,
+				       hnat_priv->foe_etry_num *
+				       sizeof(struct hnat_accounting));
+				if (hnat_priv->acct_sync[ppe_id])
+					memset(hnat_priv->acct_sync[ppe_id], 0,
+					       hnat_priv->foe_etry_num *
+					       sizeof(struct hnat_accounting));
+				spin_unlock_bh(&hnat_priv->acct_lock[ppe_id]);
+			}
 		}
 
 		hnat_hw_init(ppe_id);
@@ -680,6 +703,9 @@ static int hnat_probe(struct platform_device *pdev)
 	hnat_priv = devm_kzalloc(&pdev->dev, sizeof(struct mtk_hnat), GFP_KERNEL);
 	if (!hnat_priv)
 		return -ENOMEM;
+
+	for (i = 0; i < MAX_PPE_NUM; i++)
+		spin_lock_init(&hnat_priv->acct_lock[i]);
 
 	hnat_priv->foe_etry_num = DEF_ETRY_NUM;
 
@@ -732,7 +758,14 @@ static int hnat_probe(struct platform_device *pdev)
 		dev_info(&pdev->dev, "wan dsa port = %d\n", hnat_priv->wan_dsa_port);
 	}
 
-	hnat_priv->ppe_num = ppe_cnt;
+	if (ppe_cnt < 1 || ppe_cnt > MAX_PPE_NUM) {
+		dev_warn(&pdev->dev,
+			 "invalid ppe_cnt=%d, using supported maximum %d\n",
+			 ppe_cnt, MAX_PPE_NUM);
+		hnat_priv->ppe_num = MAX_PPE_NUM;
+	} else {
+		hnat_priv->ppe_num = ppe_cnt;
+	}
 
 	if (IS_GMAC1_MODE)
 		hnat_priv->ppe_num = 1;

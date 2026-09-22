@@ -813,13 +813,14 @@ static const debugfs_write_func cr_set_func[] = {
 	[12] = set_macvlan_support,
 };
 
-int read_mib(struct mtk_hnat *h, u32 ppe_id,
-	     u32 index, u64 *bytes, u64 *packets)
+static int read_mib(struct mtk_hnat *h, u32 ppe_id,
+		    u32 index, u64 *bytes, u64 *packets)
 {
 	int ret;
 	u32 val, cnt_r0, cnt_r1, cnt_r2;
 
-	if (ppe_id >= CFG_PPE_NUM)
+	if (!h || !bytes || !packets || ppe_id >= h->ppe_num ||
+	    !h->ppe_base[ppe_id])
 		return -EINVAL;
 
 	writel(index | (1 << 16), h->ppe_base[ppe_id] + PPE_MIB_SER_CR);
@@ -827,55 +828,167 @@ int read_mib(struct mtk_hnat *h, u32 ppe_id,
 					!(val & BIT_MIB_BUSY), 20, 10000);
 
 	if (ret < 0) {
-		pr_notice("mib busy, please check later\n");
+		pr_notice_ratelimited("mib busy, please check later\n");
 		return ret;
 	}
 	cnt_r0 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R0);
 	cnt_r1 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R1);
 	cnt_r2 = readl(h->ppe_base[ppe_id] + PPE_MIB_SER_R2);
 	*bytes = cnt_r0 + ((u64)(cnt_r1 & 0xffff) << 32);
-	*packets = ((cnt_r1 & 0xffff0000) >> 16) + ((cnt_r2 & 0xffffff) << 16);
+	*packets = ((cnt_r1 & 0xffff0000) >> 16) +
+		   ((u64)(cnt_r2 & 0xffffff) << 16);
 
 	return 0;
 
 }
 
-struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
-				       u32 index, struct hnat_accounting *diff)
-
+static int accounting_update_locked(struct mtk_hnat *h, u32 ppe_id,
+				    u32 index, struct hnat_accounting *diff)
 {
 	u64 bytes, packets;
+	int err;
 
-	if (ppe_id >= CFG_PPE_NUM)
-		return NULL;
-
-	if (!hnat_priv->data->per_flow_accounting)
-		return NULL;
-
-	if (read_mib(h, ppe_id, index, &bytes, &packets))
-		return NULL;
+	err = read_mib(h, ppe_id, index, &bytes, &packets);
+	if (err)
+		return err;
 
 	h->acct[ppe_id][index].bytes += bytes;
 	h->acct[ppe_id][index].packets += packets;
-	
+
 	if (diff) {
 		diff->bytes = bytes;
 		diff->packets = packets;
 	}
 
+	return 0;
+}
+
+int hnat_accounting_update(struct mtk_hnat *h, u32 ppe_id, u32 index,
+			   struct hnat_accounting *diff)
+{
+	int err;
+
+	if (!h || !h->data || ppe_id >= h->ppe_num ||
+	    index >= h->foe_etry_num)
+		return -EINVAL;
+
+	if (!h->data->per_flow_accounting || !h->acct[ppe_id])
+		return -EOPNOTSUPP;
+
+	spin_lock_bh(&h->acct_lock[ppe_id]);
+	err = accounting_update_locked(h, ppe_id, index, diff);
+	spin_unlock_bh(&h->acct_lock[ppe_id]);
+
+	return err;
+}
+
+int hnat_accounting_read(struct mtk_hnat *h, u32 ppe_id, u32 index,
+			 struct hnat_accounting *total)
+{
+	if (!h || !h->data || !total || ppe_id >= h->ppe_num ||
+	    index >= h->foe_etry_num)
+		return -EINVAL;
+
+	if (!h->data->per_flow_accounting || !h->acct[ppe_id])
+		return -EOPNOTSUPP;
+
+	spin_lock_bh(&h->acct_lock[ppe_id]);
+	*total = h->acct[ppe_id][index];
+	spin_unlock_bh(&h->acct_lock[ppe_id]);
+
+	return 0;
+}
+
+int hnat_accounting_sync(struct mtk_hnat *h, u32 ppe_id, u32 index,
+			 struct hnat_accounting *pending)
+{
+	struct hnat_accounting *total;
+	struct hnat_accounting *synced;
+	int err;
+
+	if (!h || !h->data || !pending || ppe_id >= h->ppe_num ||
+	    index >= h->foe_etry_num)
+		return -EINVAL;
+
+	if (!h->data->per_flow_accounting || !h->acct[ppe_id] ||
+	    !h->acct_sync[ppe_id])
+		return -EOPNOTSUPP;
+
+	spin_lock_bh(&h->acct_lock[ppe_id]);
+	err = accounting_update_locked(h, ppe_id, index, NULL);
+	if (!err) {
+		total = &h->acct[ppe_id][index];
+		synced = &h->acct_sync[ppe_id][index];
+
+		pending->bytes = total->bytes >= synced->bytes
+			? total->bytes - synced->bytes : total->bytes;
+		pending->packets = total->packets >= synced->packets
+			? total->packets - synced->packets : total->packets;
+		*synced = *total;
+	}
+	spin_unlock_bh(&h->acct_lock[ppe_id]);
+
+	return err;
+}
+
+int hnat_accounting_reset(struct mtk_hnat *h, u32 ppe_id, u32 index)
+{
+	u64 bytes, packets;
+	int err;
+
+	if (!h || !h->data)
+		return -EINVAL;
+
+	/* Keep entry binding unchanged on SoCs without per-flow accounting. */
+	if (!h->data->per_flow_accounting)
+		return 0;
+
+	if (ppe_id >= h->ppe_num || index >= h->foe_etry_num)
+		return -EINVAL;
+
+	if (!h->acct[ppe_id] || !h->acct_sync[ppe_id])
+		return -EOPNOTSUPP;
+
+	spin_lock_bh(&h->acct_lock[ppe_id]);
+	/* Discard counters left by the previous owner of this PPE entry. */
+	err = read_mib(h, ppe_id, index, &bytes, &packets);
+	if (!err) {
+		memset(&h->acct[ppe_id][index], 0,
+		       sizeof(struct hnat_accounting));
+		memset(&h->acct_sync[ppe_id][index], 0,
+		       sizeof(struct hnat_accounting));
+	}
+	spin_unlock_bh(&h->acct_lock[ppe_id]);
+
+	return err;
+}
+
+/* Compatibility wrapper for vendor modules built against the old API. */
+struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
+				       u32 index, struct hnat_accounting *diff)
+{
+	if (hnat_accounting_update(h, ppe_id, index, diff))
+		return NULL;
+
 	return &h->acct[ppe_id][index];
 }
 EXPORT_SYMBOL(hnat_get_count);
 
-#define PRINT_COUNT(m, acct) {if (acct) \
-		seq_printf(m, "bytes=%llu|packets=%llu|", \
-			   acct->bytes, acct->packets); }
+static void print_count(struct seq_file *m,
+			const struct hnat_accounting *acct)
+{
+	if (acct)
+		seq_printf(m, "bytes=%llu|packets=%llu|",
+			   acct->bytes, acct->packets);
+}
+
 static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 {
 	struct mtk_hnat *h = hnat_priv;
 	struct foe_entry *entry, *end;
 	unsigned char h_dest[ETH_ALEN];
 	unsigned char h_source[ETH_ALEN];
+	struct hnat_accounting acct_data;
 	struct hnat_accounting *acct;
 	u32 entry_index = 0;
 
@@ -890,7 +1003,14 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			entry_index++;
 			continue;
 		}
-		acct = hnat_get_count(h, ppe_id, entry_index, NULL);
+		acct = NULL;
+		/*
+		 * Keep debugfs output live: the old implementation sampled the
+		 * hardware MIB whenever an entry was displayed.
+		 */
+		if (!hnat_accounting_update(h, ppe_id, entry_index, NULL) &&
+		    !hnat_accounting_read(h, ppe_id, entry_index, &acct_data))
+			acct = &acct_data;
 		if (IS_IPV4_HNAPT(entry)) {
 			__be32 saddr = htonl(entry->ipv4_hnapt.sip);
 			__be32 daddr = htonl(entry->ipv4_hnapt.dip);
@@ -903,7 +1023,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv4_hnapt.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv4_hnapt.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|%pI4:%d->%pI4:%d=>%pI4:%d->%pI4:%d|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x|vlan1=%d|vlan2=%d\n",
 				   entry, ppe_id, ei(entry, end),
@@ -929,7 +1049,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv4_hnapt.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv4_hnapt.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|%pI4->%pI4=>%pI4->%pI4|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x|vlan1=%d|vlan2=%d\n",
 				   entry, ppe_id, ei(entry, end),
@@ -957,7 +1077,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv6_5t_route.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv6_5t_route.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|SIP=%08x:%08x:%08x:%08x(sp=%d)->DIP=%08x:%08x:%08x:%08x(dp=%d)|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x\n",
 				   entry, ppe_id, ei(entry, end), es(entry), pt(entry), ipv6_sip0,
@@ -985,7 +1105,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv6_5t_route.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv6_5t_route.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|SIP=%08x:%08x:%08x:%08x->DIP=%08x:%08x:%08x:%08x|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x\n",
 				   entry, ppe_id, ei(entry, end),
@@ -1014,7 +1134,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv6_5t_route.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv6_5t_route.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|SIP=%08x:%08x:%08x:%08x(sp=%d)->DIP=%08x:%08x:%08x:%08x(dp=%d)|TSIP=%pI4->TDIP=%pI4|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x\n",
 				   entry, ppe_id, ei(entry, end),
@@ -1045,7 +1165,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv4_dslite.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv4_dslite.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|SIP=%pI4->DIP=%pI4|TSIP=%08x:%08x:%08x:%08x->TDIP=%08x:%08x:%08x:%08x|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x\n",
 				   entry, ppe_id, ei(entry, end),
@@ -1077,7 +1197,7 @@ static int __hnat_debug_show(struct seq_file *m, void *private, u32 ppe_id)
 			*((u32 *)h_dest) = swab32(entry->ipv4_dslite.dmac_hi);
 			*((u16 *)&h_dest[4]) =
 				swab16(entry->ipv4_dslite.dmac_lo);
-			PRINT_COUNT(m, acct);
+			print_count(m, acct);
 			seq_printf(m,
 				   "addr=0x%p|ppe=%d|index=%d|state=%s|type=%s|SIP=%pI4:%d->DIP=%pI4:%d|NSIP=%pI4:%d->NDIP=%pI4:%d|TSIP=%08x:%08x:%08x:%08x->TDIP=%08x:%08x:%08x:%08x|%pM=>%pM|etype=0x%04x|info1=0x%x|info2=0x%x\n",
 				   entry, ppe_id, ei(entry, end),
@@ -2326,10 +2446,11 @@ static const struct file_operations hnat_version_fops = {
 int get_ppe_mib(u32 ppe_id, int index, u64 *pkt_cnt, u64 *byte_cnt)
 {
 	struct mtk_hnat *h = hnat_priv;
-	struct hnat_accounting *acct;
+	struct hnat_accounting acct;
 	struct foe_entry *entry;
+	int err;
 
-	if (ppe_id >= CFG_PPE_NUM)
+	if (!h || !pkt_cnt || !byte_cnt || ppe_id >= h->ppe_num)
 		return -EINVAL;
 
 	if (index < 0 || index >= h->foe_etry_num) {
@@ -2337,17 +2458,27 @@ int get_ppe_mib(u32 ppe_id, int index, u64 *pkt_cnt, u64 *byte_cnt)
 		return -EINVAL;
 	}
 
-	acct = hnat_get_count(h, ppe_id, index, NULL);
-	entry = hnat_priv->foe_table_cpu[ppe_id] + index;
+	if (!h->foe_table_cpu[ppe_id])
+		return -ENODEV;
 
-	if (!acct)
-		return -1;
-
+	entry = h->foe_table_cpu[ppe_id] + index;
 	if (entry->bfib1.state != BIND)
-		return -1;
+		return -ENOENT;
 
-	*pkt_cnt = acct->packets;
-	*byte_cnt = acct->bytes;
+	/*
+	 * Preserve the old API behavior: include MIB data accumulated since the
+	 * previous read while keeping the software total protected by the lock.
+	 */
+	err = hnat_accounting_update(h, ppe_id, index, NULL);
+	if (err)
+		return err;
+
+	err = hnat_accounting_read(h, ppe_id, index, &acct);
+	if (err)
+		return err;
+
+	*pkt_cnt = acct.packets;
+	*byte_cnt = acct.bytes;
 
 	return 0;
 }

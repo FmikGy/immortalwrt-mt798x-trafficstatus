@@ -12,6 +12,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/if.h>
 #include <linux/if_ether.h>
@@ -648,6 +649,9 @@ struct mtk_hnat {
 	struct mib_entry *foe_mib_cpu[MAX_PPE_NUM];
 	dma_addr_t foe_mib_dev[MAX_PPE_NUM];
 	struct hnat_accounting *acct[MAX_PPE_NUM];
+	struct hnat_accounting *acct_sync[MAX_PPE_NUM];
+	/* Serializes read-clear MIB access and both accounting arrays. */
+	spinlock_t acct_lock[MAX_PPE_NUM];
 	const struct mtk_hnat_data *data;
 
 	/*devices we plays for*/
@@ -991,6 +995,13 @@ int entry_delete_by_mac(u8 *mac);
 int entry_delete(u32 ppe_id, int index);
 int hnat_warm_init(void);
 
+int hnat_accounting_update(struct mtk_hnat *h, u32 ppe_id, u32 index,
+			   struct hnat_accounting *diff);
+int hnat_accounting_read(struct mtk_hnat *h, u32 ppe_id, u32 index,
+			 struct hnat_accounting *total);
+int hnat_accounting_sync(struct mtk_hnat *h, u32 ppe_id, u32 index,
+			 struct hnat_accounting *pending);
+int hnat_accounting_reset(struct mtk_hnat *h, u32 ppe_id, u32 index);
 struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 				       u32 index, struct hnat_accounting *diff);
 

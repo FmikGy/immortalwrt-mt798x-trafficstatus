@@ -1790,12 +1790,12 @@ static unsigned int skb_to_hnat_info(struct sk_buff *skb,
 		entry.bfib1.state = BIND;
 	}
 
+	/* Clear accounting state before exposing a rebound PPE entry. */
+	if (hnat_accounting_reset(hnat_priv, skb_hnat_ppe(skb),
+				  skb_hnat_entry(skb)))
+		return -EAGAIN;
 	wmb();
 	memcpy(foe, &entry, sizeof(entry));
-	/*reset statistic for this entry*/
-	if (hnat_priv->data->per_flow_accounting)
-		memset(&hnat_priv->acct[skb_hnat_ppe(skb)][skb_hnat_entry(skb)],
-		       0, sizeof(struct mib_entry));
 
 	skb_hnat_filled(skb) = HNAT_INFO_FILLED;
 
@@ -2120,6 +2120,19 @@ static void mtk_hnat_dscp_update(struct sk_buff *skb, struct foe_entry *entry)
 	}
 }
 
+static void hnat_counter_sub_saturating(atomic64_t *counter, u64 value)
+{
+	s64 old, new;
+
+	do {
+		old = atomic64_read(counter);
+		if (old <= 0)
+			return;
+
+		new = (u64)old > value ? old - (s64)value : 0;
+	} while (atomic64_cmpxchg(counter, old, new) != old);
+}
+
 static void mtk_hnat_nf_update(struct sk_buff *skb)
 {
 	struct nf_conn *ct;
@@ -2129,17 +2142,24 @@ static void mtk_hnat_nf_update(struct sk_buff *skb)
 	struct hnat_accounting diff;
 
 	ct = nf_ct_get(skb, &ctinfo);
-	if (ct) {
-		if (!hnat_get_count(hnat_priv, skb_hnat_ppe(skb), skb_hnat_entry(skb), &diff))
-			return;
+	if (!ct)
+		return;
 
-		acct = nf_conn_acct_find(ct);
-		if (acct) {
-			counter = acct->counter;
-			atomic64_add(diff.packets, &counter[CTINFO2DIR(ctinfo)].packets);
-			atomic64_add(diff.bytes, &counter[CTINFO2DIR(ctinfo)].bytes);
-		}
-	}
+	acct = nf_conn_acct_find(ct);
+	if (!acct)
+		return;
+
+	if (hnat_accounting_sync(hnat_priv, skb_hnat_ppe(skb),
+				 skb_hnat_entry(skb), &diff))
+		return;
+
+	counter = &acct->counter[CTINFO2DIR(ctinfo)];
+	/* The PPE keepalive is synthetic but has already crossed conntrack. */
+	hnat_counter_sub_saturating(&counter->packets, 1);
+	hnat_counter_sub_saturating(&counter->bytes, skb->len);
+
+	atomic64_add(diff.packets, &counter->packets);
+	atomic64_add(diff.bytes, &counter->bytes);
 }
 
 static unsigned int mtk_hnat_nf_post_routing(
@@ -2571,4 +2591,3 @@ int mtk_hqos_ptype_cb(struct sk_buff *skb, struct net_device *dev,
 
 	return 0;
 }
-

@@ -16,6 +16,7 @@
 /overlay
 /package/feeds
 /package/openwrt-packages
+/package/mtk/applications/luci-app-trafficstatus/preview/
 /*.patch
 key-build*
 *.orig

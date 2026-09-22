@@ -10,6 +10,23 @@ Default login address: http://192.168.1.1 or http://immortalwrt.lan, username: _
 ## About immortalwrt-mt798x 
 - https://cmi.hanwckf.top/p/immortalwrt-mt798x/
 
+## Traffic accounting extension
+
+This fork adds hardware-offload-aware per-client traffic accounting for
+MediaTek MT7981 and MT7986 targets:
+
+- MediaTek HNAT per-flow MIB counters are synchronized into conntrack
+  accounting without disabling hardware acceleration.
+- `nlbwmon` collects the synchronized counters and provides the usage data.
+- `luci-app-trafficstatus` provides a responsive LuCI interface with live
+  rates, 15-minute history, IPv4/IPv6 aggregation by MAC address, and
+  Simplified Chinese translations.
+- The supplied MT7981/MT7986 defconfigs enable the complete feature set.
+
+The implementation is specific to MediaTek HNAT. Qualcomm/NSS preview code is
+not included. See [TRAFFICSTATUS.md](TRAFFICSTATUS.md) for architecture, build,
+and verification details.
+
 ## Development
 To build your own firmware you need a GNU/Linux, BSD or MacOSX system (case sensitive filesystem required). Cygwin is unsupported because of the lack of a case sensitive file system.<br/>
 

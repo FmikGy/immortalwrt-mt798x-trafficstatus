@@ -1,0 +1,8 @@
+#!/bin/sh
+
+if [ "$#" -ne 1 ] || [ "$1" != snapshot ]; then
+	echo "Usage: $0 snapshot" >&2
+	exit 2
+fi
+
+exec /usr/sbin/nlbw -c json -g mac,ip -o -rx_bytes,-tx_bytes -n

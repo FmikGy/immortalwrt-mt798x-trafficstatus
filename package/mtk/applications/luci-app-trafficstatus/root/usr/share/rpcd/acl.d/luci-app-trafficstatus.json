@@ -1,0 +1,14 @@
+{
+	"luci-app-trafficstatus": {
+		"description": "Grant access to the hardware-aware traffic status view",
+		"read": {
+			"cgi-io": [ "exec" ],
+			"file": {
+				"/usr/libexec/trafficstatus-action snapshot": [ "exec" ]
+			},
+			"ubus": {
+				"luci-rpc": [ "getHostHints" ]
+			}
+		}
+	}
+}
